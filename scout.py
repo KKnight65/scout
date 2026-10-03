@@ -56,6 +56,7 @@ LESSONS = BASE / "lessons.md"
 
 # ---------------------------------------------------------------- prompts
 PROMPT_FILE = BASE / "prompt.md"   # YOUR prompt - edit anytime, used by #ape AND #ideas
+FORMATS_FILE = BASE / "formats.md"  # how #ape / #ideas / digest posts look - edit anytime
 RULES_FILE = BASE / "my_rules.md"  # your /rule commands - never overwritten by the model
 
 
@@ -65,13 +66,45 @@ def core_prompt():
     rules = RULES_FILE.read_text(encoding="utf-8").strip() if RULES_FILE.exists() else ""
     return (base.strip() +
             ("\n\nJUAN'S RULES (highest priority, always follow):\n" + rules if rules else "") +
+            verdicts_block() +
             "\n\nLESSONS FROM PAST OUTCOMES (apply these):\n" + lessons())
+
+
+def verdicts_block(limit=25):
+    """Juan's thumbs up/down on past projects - the strongest signal of his taste."""
+    try:
+        con = sqlite3.connect(DB)
+        rows = con.execute("SELECT project, juan_verdict, juan_note, hook FROM reviews WHERE juan_verdict IS NOT NULL "
+                           "ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return ""
+    if not rows:
+        return ""
+    lines = [f"- {v.upper()}: {p} - {note or '(no note)'} | hook was: {hook or '-'}" for p, v, note, hook in rows]
+    return ("\n\nJUAN'S VERDICTS ON PAST PROJECTS (ground truth - pick what he calls GOOD, avoid what he calls BAD):\n"
+            + "\n".join(lines))
+
+
+def formats(section):
+    """Read one '## section' from formats.md. Re-read every call so edits apply instantly."""
+    if not FORMATS_FILE.exists():
+        return ""
+    text, out, on = FORMATS_FILE.read_text(encoding="utf-8"), [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            on = line[3:].strip().lower() == section
+            continue
+        if on:
+            out.append(line)
+    body = "\n".join(out).strip()
+    return f"\n\nOUTPUT FORMAT (from Juan's formats.md - follow EXACTLY, nothing extra):\n{body}" if body else ""
 
 
 FILTER_TASK = """
 
 TASK: judge the ONE project below for #ape. Reply with ONLY this JSON, no other text:
-{"alert": true|false, "project": "name", "x_url": "url or empty", "hook": "one sentence describing the actual mechanism/concept/narrative", "source": "best first-party url or empty", "category": "mechanism|game|economic-loop|narrative|premise|primitive|incentive|generic", "skip_reason": "short reason if not alerting"}"""
+{"alert": true|false, "project": "name", "x_url": "url or empty", "hook": "one sentence describing the actual mechanism/concept/narrative", "source": "best first-party url or empty", "followers": "notable accounts that followed, if the post names them, else empty", "category": "mechanism|game|economic-loop|narrative|premise|primitive|incentive|generic", "skip_reason": "short reason if not alerting"}"""
 
 LESSONS_PROMPT = """You maintain lessons.md for a crypto project scout. Below are the current lessons and recent reviewed projects with their real outcomes 24h/72h later (DexScreener volume, liquidity, buys/sells; "no token" means none found).
 
@@ -80,31 +113,15 @@ Rewrite lessons.md (max 40 lines) as concrete rules:
 - false positives to stop alerting on
 - misses: skipped projects that ran, and what was overlooked
 - RUNNERS: projects with peak_mcap at or above the runner threshold - what they had in common, so both #ape picks and #ideas concepts follow what actually runs
-Raise the bar where alerts underperform; lower it where runners are being missed. Never contradict Juan's rules. Output only the new lessons.md text."""
+- JUAN'S VERDICTS ('JUAN SAID GOOD/BAD') are ground truth about his taste - weigh them above market data and write explicit rules from them\nRaise the bar where alerts underperform; lower it where runners are being missed. Never contradict Juan's rules. Output only the new lessons.md text."""
 
-CONCEPT_PROMPT = """You help Juan create original memecoin concepts to launch on hood.fun (Robinhood Chain). Use the reviewed projects and lessons below to identify which HOOK TYPES are winning, then write the requested output.
+CONCEPT_PROMPT = """You help Juan create original memecoin concepts. Use the reviewed projects, Juan's verdicts and the lessons to spot which HOOK TYPES are winning.
 
-Rules: be original - never reuse another project's name, ticker, art, branding or copy. Borrow the pattern (loop, incentive, narrative angle) and make it new or better. It must work as a simple token launch on hood.fun; if the mechanism needs a custom contract, say so and give the simplest version that launches today. Each concept needs a clear reason to buy and a clear reason to share.
-
-Concept format (plain text, Discord markdown ok):
-**CONCEPT: Name ($TICKER)**
-Hook: one sentence - why people buy
-Inspired by pattern: hook type + 1-2 examples from the log
-Mechanic: how it works at launch
-Why it can beat the originals: one sentence
-PFP prompt: ...
-Banner prompt: ...
-Site headline + subline: ...
-Launch X posts: 3 posts under 200 chars
-Risk: the one thing most likely to make it flop"""
+Be original - never reuse another project's name, ticker or branding. Borrow the pattern and make it better. Clear reason to buy, clear reason to share. Juan hates long essays: no intro, no outro, nothing outside the output format."""
 
 RUNNER_PROMPT = CONCEPT_PROMPT + """
 
-You are given ONE project that actually ran (hit the market cap shown). Output, in this order:
-**What it is:** one sentence
-**Why it ran:** 2-3 bullets - the real hook, the incentive, the narrative timing
-**Pattern to copy:** one sentence naming the reusable pattern
-Then 2 concepts in the concept format above."""
+You are given ONE project that actually ran (hit the market cap shown)."""
 
 # ---------------------------------------------------------------- helpers
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
@@ -132,7 +149,7 @@ def db():
         x_url TEXT, site TEXT, ca TEXT, category TEXT, hook TEXT, skip_reason TEXT,
         alerted INTEGER, raw TEXT, chk24 TEXT, chk72 TEXT)""")
     con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
-    for col in ("peak_mcap REAL", "ideas_posted INTEGER DEFAULT 0", "last_search TEXT"):
+    for col in ("peak_mcap REAL", "ideas_posted INTEGER DEFAULT 0", "last_search TEXT", "juan_verdict TEXT", "juan_note TEXT"):
         try:
             con.execute(f"ALTER TABLE reviews ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -293,7 +310,8 @@ async def handle(msg, grp):
         await discord(f"**{name} — UNIQUE WATCH**\n"
                       f"X: {out.get('x_url') or x_url or 'n/a'}\n"
                       f"Why it is different: {out['hook']}\n"
-                      f"Source: {out.get('source') or site or 'n/a'}")
+                      + (f"Notable followers: {out['followers']}\n" if out.get("followers") else "")
+                      + f"Source: {out.get('source') or site or 'n/a'}")
 
 
 async def dex(ca, project):
@@ -371,7 +389,7 @@ async def post_runner(rid):
     info = (f"PROJECT: {project}\nPEAK MARKET CAP: {fmt_usd(peak)}\nX: {x_url}\nSITE: {site}\nCATEGORY: {cat}\n"
             f"HOOK NOTE: {hook}\nORIGINAL POST:\n{(raw or '')[:1500]}\nSITE TEXT:\n{site_text[:2500]}\n\n"
             )
-    out = await llm(core_prompt() + "\n\n---\n" + RUNNER_PROMPT, info, max_tokens=2000, temp=0.8)
+    out = await llm(core_prompt() + "\n\n---\n" + RUNNER_PROMPT + formats("ideas runner post"), info, max_tokens=500, temp=0.8)
     header = (f"**🚀 {project or 'Unknown'} hit {fmt_usd(peak)} mcap**\n"
               f"X: {x_url or 'n/a'} | Site: {site or 'n/a'}\nCA: `{ca}`\n")
     await discord(header + (out.strip() or "(model returned nothing)"), IDEAS_WEBHOOK)
@@ -433,13 +451,15 @@ async def outcome_loop():
 def recent_log(days=7, limit=200, outcomes=True):
     since = (now() - dt.timedelta(days=days)).isoformat(timespec="seconds")
     with db() as con:
-        rows = con.execute("SELECT ts,project,category,alerted,hook,skip_reason,chk24,chk72,peak_mcap FROM reviews "
+        rows = con.execute("SELECT ts,project,category,alerted,hook,skip_reason,chk24,chk72,peak_mcap,juan_verdict,juan_note FROM reviews "
                            "WHERE ts >= ? ORDER BY ts DESC LIMIT ?", (since, limit)).fetchall()
     lines = []
-    for ts, p, cat, al, hook, skip, c24, c72, peak in rows:
+    for ts, p, cat, al, hook, skip, c24, c72, peak, jv, jn in rows:
         line = f"{ts[:16]} | {p} | {cat} | {'ALERTED' if al else 'skipped'} | {hook or skip}"
         if outcomes:
             line += f" | peak_mcap={fmt_usd(peak) if peak else '-'} | 24h={c24 or '-'} | 72h={c72 or '-'}"
+        if jv:
+            line += f" | JUAN SAID {jv.upper()}: {jn or ''}"
         lines.append(line)
     return "\n".join(lines) or "(no reviews yet)"
 
@@ -454,11 +474,11 @@ async def update_lessons():
 
 
 async def concepts(n=3, digest=False):
-    ask = (f"Write a DAILY DIGEST: (1) top 3 hook types today with 1 example each, (2) what's working per the "
-           f"lessons, (3) {n} coin concepts." if digest else f"Write {n} coin concepts.")
-    out = await llm(core_prompt() + "\n\n---\n" + CONCEPT_PROMPT,
+    ask = f"Write the daily digest with {n} concepts." if digest else f"Write {n} concepts."
+    fmt = formats("daily digest") if digest else formats("concepts")
+    out = await llm(core_prompt() + "\n\n---\n" + CONCEPT_PROMPT + fmt,
                     f"{ask}\n\nREVIEWED PROJECTS (last 7 days):\n{recent_log(limit=150)}",
-                    max_tokens=2500, temp=0.8)
+                    max_tokens=900, temp=0.8)
     if out.strip():
         await discord(("**📊 DAILY DIGEST**\n" if digest else "**💡 CONCEPTS**\n") + out.strip(), IDEAS_WEBHOOK)
 

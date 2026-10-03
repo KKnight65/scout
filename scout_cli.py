@@ -10,7 +10,13 @@ scout_cli.py - the "hands" Hermes Agent uses to read and steer the scout.
   python scout_cli.py rule list | rule del <N>
   python scout_cli.py prompt                 show the main prompt
   python scout_cli.py lessons                show learned lessons
+  python scout_cli.py feedback <name> good|bad <why>   record Juan's verdict on a project (teaches the scout)
+  python scout_cli.py verdicts               list Juan's verdicts
+  python scout_cli.py setting <KEY> <VALUE>  change a setting and restart the scout
+  python scout_cli.py formats                show formats.md (how posts look)
+  python scout_cli.py audit                  everything currently in effect (run after every change)
 """
+import subprocess
 import datetime as dt
 import json
 import sqlite3
@@ -19,7 +25,8 @@ import urllib.request
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-DB, RULES, PROMPT, LESSONS = (BASE / n for n in ("scout.db", "my_rules.md", "prompt.md", "lessons.md"))
+DB, RULES, PROMPT, LESSONS, FORMATS = (BASE / n for n in ("scout.db", "my_rules.md", "prompt.md", "lessons.md", "formats.md"))
+SETTINGS = {"DAILY_ALERT_CAP", "MIN_MCAP", "DIGEST_HOUR", "TRACK_HOURS", "MCAP_EVERY_MIN", "CHECK_EVERY_MIN", "MODEL"}
 
 import os
 
@@ -34,9 +41,20 @@ for line in (cfg.read_text(encoding="utf-8").splitlines() if cfg.exists() else [
 def q(sql, args=()):
     con = sqlite3.connect(DB)
     try:
-        return con.execute(sql, args).fetchall()
+        for col in ("juan_verdict TEXT", "juan_note TEXT"):
+            try:
+                con.execute(f"ALTER TABLE reviews ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
+        rows = con.execute(sql, args).fetchall()
+        con.commit()
+        return rows
     finally:
         con.close()
+
+
+def restart_scout():
+    subprocess.run(["bash", str(BASE / "start.sh")], check=False)
 
 
 def usd(v):
@@ -94,5 +112,48 @@ elif cmd == "rule" and len(a) > 1:
 elif cmd in ("prompt", "lessons"):
     f = PROMPT if cmd == "prompt" else LESSONS
     print(f.read_text(encoding="utf-8") if f.exists() else "(empty)")
+elif cmd == "feedback" and len(a) > 3 and a[2].lower() in ("good", "bad"):
+    name, verdict, note = a[1].lstrip("@"), a[2].lower(), " ".join(a[3:])
+    w = f"%{name}%"
+    row = q("SELECT id, project FROM reviews WHERE project LIKE ? OR x_url LIKE ? OR key LIKE ? ORDER BY ts DESC LIMIT 1",
+            (w, w, w))
+    if row:
+        q("UPDATE reviews SET juan_verdict=?, juan_note=? WHERE id=?", (verdict, note, row[0][0]))
+        print(f"Saved: {row[0][1]} = {verdict.upper()} ({note}). The scout uses this on every future judgment.")
+    else:
+        q("INSERT INTO reviews(ts, grp, key, project, hook, alerted, juan_verdict, juan_note) VALUES(?,?,?,?,?,?,?,?)",
+          (dt.datetime.now().isoformat(timespec="seconds"), "manual", f"manual:{name.lower()}", name, "", 0, verdict, note))
+        print(f"Not in the log - saved as a manual example: {name} = {verdict.upper()} ({note}).")
+elif cmd == "verdicts":
+    for p, v, n in q("SELECT project, juan_verdict, juan_note FROM reviews WHERE juan_verdict IS NOT NULL ORDER BY rowid DESC"):
+        print(f"{v.upper():4} | {p} | {n}")
+elif cmd == "setting" and len(a) > 2:
+    key, val = a[1].upper(), a[2]
+    if key not in SETTINGS:
+        sys.exit(f"Unknown setting. Allowed: {', '.join(sorted(SETTINGS))}")
+    lines = [l for l in (cfg.read_text(encoding="utf-8").splitlines() if cfg.exists() else [])
+             if not l.startswith(key + "=")]
+    lines.append(f"{key}={val}")
+    cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    restart_scout()
+    print(f"{key}={val} saved and scout restarted.")
+elif cmd == "formats":
+    print(FORMATS.read_text(encoding="utf-8") if FORMATS.exists() else "(no formats.md)")
+elif cmd == "audit":
+    print("=== SETTINGS ===")
+    for k in sorted(SETTINGS):
+        print(f"{k}={env.get(k, '(default)')}")
+    print("\n=== JUAN'S RULES ===")
+    print(RULES.read_text(encoding="utf-8") if RULES.exists() else "(none)")
+    print("=== FORMATS ===")
+    print(FORMATS.read_text(encoding="utf-8") if FORMATS.exists() else "(none)")
+    print("=== VERDICTS ===")
+    good = q("SELECT COUNT(*) FROM reviews WHERE juan_verdict='good'")[0][0]
+    bad = q("SELECT COUNT(*) FROM reviews WHERE juan_verdict='bad'")[0][0]
+    print(f"{good} good, {bad} bad")
+    print("\n=== LESSONS (first 15 lines) ===")
+    print("\n".join((LESSONS.read_text(encoding="utf-8") if LESSONS.exists() else "(none yet)").splitlines()[:15]))
+    running = subprocess.run(["pgrep", "-f", "venv/bin/python scout.py"], capture_output=True, text=True).stdout.split()
+    print(f"\n=== SCOUT PROCESS === {'running (' + str(len(running)) + ')' if running else 'NOT RUNNING'}")
 else:
     print(__doc__)
